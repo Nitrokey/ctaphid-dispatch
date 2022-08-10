@@ -62,10 +62,17 @@ impl Dispatch {
             // info_now!("cmd: {}", u8::from(command));
             // info_now!("cmd: {:?}", command);
 
-            if let Some(app) = Self::find_app(command, apps) {
-                // match app.call(command, self.responder.response_mut().unwrap()) {
+            let apps = apps.iter_mut()
+                .filter(|app| app.commands().contains(&command) && app.peek(&message));
+
+            let mut responded = false;
+            for app in apps.into_iter() {
+                if !app.peek(&message) { continue }
                 self.call_app(*app, command, &message);
-            } else {
+                responded = true;
+                break;
+            }
+            if !responded {
                 self.reply_with_error(Error::InvalidCommand);
             }
         }

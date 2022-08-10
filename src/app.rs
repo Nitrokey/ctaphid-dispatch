@@ -8,6 +8,10 @@ pub trait App {
     /// Define which CTAPHID commands to register to.
     fn commands(&self) -> &'static [Command];
 
+    fn peek(&self, request: &Message) -> bool {
+        true
+    }
+
     /// Application is called here when one of it's register commands occurs.
     /// Application must put response in @message, or decide to return an error.
     ///
