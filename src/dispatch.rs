@@ -67,7 +67,6 @@ impl Dispatch {
 
             let mut responded = false;
             for app in apps.into_iter() {
-                if !app.peek(&message) { continue }
                 self.call_app(*app, command, &message);
                 responded = true;
                 break;
