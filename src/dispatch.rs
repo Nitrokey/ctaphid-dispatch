@@ -1,20 +1,41 @@
-use crate::app::App;
-use crate::types::{Command, Error, HidInterchange, Message};
-use interchange::{Interchange, Responder};
+use core::sync::atomic::Ordering;
 
-pub struct Dispatch {
-    responder: Responder<HidInterchange>,
+use crate::app::App;
+use crate::types::{Command, Error, InterchangeResponse, Message, Responder};
+
+use trussed::interrupt::InterruptFlag;
+
+use ref_swap::OptionRefSwap;
+
+pub struct Dispatch<'pipe, 'interrupt> {
+    responder: Responder<'pipe>,
+    interrupt: Option<&'interrupt OptionRefSwap<'interrupt, InterruptFlag>>,
 }
 
-impl Dispatch {
-    pub fn new(responder: Responder<HidInterchange>) -> Dispatch {
-        Dispatch { responder }
+impl<'pipe, 'interrupt> Dispatch<'pipe, 'interrupt> {
+    pub fn new(responder: Responder<'pipe>) -> Self {
+        Dispatch {
+            responder,
+            interrupt: None,
+        }
+    }
+}
+
+impl<'pipe, 'interrupt> Dispatch<'pipe, 'interrupt> {
+    pub fn with_interrupt(
+        responder: Responder<'pipe>,
+        interrupt: Option<&'interrupt OptionRefSwap<'interrupt, InterruptFlag>>,
+    ) -> Self {
+        Dispatch {
+            responder,
+            interrupt,
+        }
     }
 
     fn find_app<'a, 'b>(
         command: Command,
-        apps: &'a mut [&'b mut dyn App],
-    ) -> Option<&'a mut &'b mut dyn App> {
+        apps: &'a mut [&'b mut dyn App<'interrupt>],
+    ) -> Option<&'a mut &'b mut dyn App<'interrupt>> {
         apps.iter_mut()
             .find(|app| app.commands().contains(&command))
     }
@@ -30,33 +51,61 @@ impl Dispatch {
     // Using helper here to take potentially large stack burden off of call chain to application.
     #[inline(never)]
     fn reply_with_error(&mut self, error: Error) {
-        self.responder.respond(&Err(error)).expect("cant respond");
+        self.reply_or_cancel(InterchangeResponse(Err(error)))
     }
 
-    #[inline(never)]
-    fn call_app(&mut self, app: &mut dyn App, command: Command, request: &Message) {
-        // now we do something that should be fixed conceptually later.
-        // We will no longer use the interchange data as request (just cloned it)
-        // We would like to pass the app a buffer to write data into - so we
-        // use the "big enough" request reference for this (it would make much more
-        // sense to use the response mut reference, but that's behind a Result).
-        //
-        // Note that this only works since Request has the same type as
-        // Response's Ok value.
-        let tuple: &mut (Command, Message) = unsafe { (&mut *self.responder.interchange.get()).rq_mut() };
-        let response_buffer = &mut tuple.1;
-        response_buffer.clear();
+    fn reply_or_cancel(&mut self, response: InterchangeResponse) {
+        if self.responder.respond(response).is_ok() {
+            return;
+        }
 
-        if let Err(error) = app.call(command, request, response_buffer) {
-            self.reply_with_error(error)
-        } else {
-            let response = Ok(response_buffer.clone());
-            self.responder.respond(&response).expect("responder failed");
+        if self.responder.acknowledge_cancel().is_err() {
+            panic!("Unexpected state: {:?}", self.responder.state());
+        }
+    }
+    fn send_reply_or_cancel(&mut self) {
+        if self.responder.send_response().is_ok() {
+            return;
+        }
+
+        if self.responder.acknowledge_cancel().is_err() {
+            panic!("Unexpected state: {:?}", self.responder.state());
         }
     }
 
     #[inline(never)]
-    pub fn poll<'a>(&mut self, apps: &mut [&'a mut dyn App]) -> bool {
+    fn call_app(&mut self, app: &mut dyn App<'interrupt>, command: Command, request: &Message) {
+        let response_buffer = self
+            .responder
+            .response_mut()
+            .expect("App calls should only happen when a respose can be constructed")
+            .0
+            .as_mut()
+            .unwrap();
+
+        // Cancellation is best-effort, and not relevant for actual synchronisation, so relaxed is used
+        let res =
+            if let (Some(app_interrupt), Some(interrupt_ptr)) = (app.interrupt(), self.interrupt) {
+                app_interrupt.set_working();
+                interrupt_ptr.store(Some(app_interrupt), Ordering::Relaxed);
+                let res = app.call(command, request, response_buffer);
+                app_interrupt.set_idle();
+                interrupt_ptr.store(None, Ordering::Relaxed);
+                res
+            } else {
+                app.call(command, request, response_buffer)
+            };
+
+        info_now!("Got res: {:?}", res);
+        if let Err(error) = res {
+            self.reply_with_error(error)
+        } else {
+            self.send_reply_or_cancel()
+        }
+    }
+
+    #[inline(never)]
+    pub fn poll(&mut self, apps: &mut [&mut dyn App<'interrupt>]) -> bool {
         let maybe_request = self.responder.take_request();
         if let Some((command, message)) = maybe_request {
             // info_now!("cmd: {}", u8::from(command));
@@ -74,8 +123,13 @@ impl Dispatch {
             if !responded {
                 self.reply_with_error(Error::InvalidCommand);
             }
+            self.responder.state() == interchange::State::Responded
+        } else {
+            match self.responder.state() {
+                interchange::State::Canceled => self.responder.acknowledge_cancel().is_ok(),
+                interchange::State::Responded => true,
+                _ => false,
+            }
         }
-
-        self.responder.state() == interchange::State::Responded
     }
 }
